@@ -1,0 +1,6 @@
+duracion,paquetes,bytes,puerto,protocolo,intentos_fallidos
+10,120,5000,80,TCP,0
+60,1300,100000,22,TCP,7
+5,70,3500,443,TCP,0
+90,1800,150000,3389,TCP,10
+25,150,8000,53,UDP,0
