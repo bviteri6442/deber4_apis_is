@@ -191,15 +191,24 @@ def ejecutar_sp(nombre, params=None):
         cn.close()
 
 
+def error_bd(exc):
+    """Respuesta 500 sin detalles internos (solo avisa si falta crear los SP)."""
+    app.logger.exception("Error en API de dashboard")
+    # 2812 = SQL Server no encuentra el procedimiento almacenado
+    if "(2812)" in str(exc):
+        return jsonify(error="No existen los procedimientos almacenados: "
+                             "ejecuta sql/03_procedimientos.sql en SSMS"), 500
+    return jsonify(error="No se pudo consultar la base de datos"), 500
+
+
 def dashboard(nombre, params=None):
     """Ejecuta un SP del dashboard con manejo de errores comun."""
     try:
         return jsonify(ejecutar_sp(nombre, params))
     except RuntimeError as exc:
         return jsonify(error=str(exc)), 503
-    except Exception:
-        app.logger.exception("Error en API de dashboard")
-        return jsonify(error="No se pudo consultar la base de datos"), 500
+    except Exception as exc:
+        return error_bd(exc)
 
 
 def leer_fecha(texto, nombre):
@@ -310,11 +319,8 @@ def dash_registros():
         filas = ejecutar_sp("sp_Dashboard_Registros", params)
     except RuntimeError as exc:
         return jsonify(error=str(exc)), 503
-    except Exception:
-        app.logger.exception("Error en API de dashboard")
-        return jsonify(
-            error="No se pudo consultar la base de datos"
-        ), 500
+    except Exception as exc:
+        return error_bd(exc)
 
     columnas = [
         "id_prediccion",
