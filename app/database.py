@@ -32,9 +32,10 @@ def guardar(resultados):
     cn = conexion()
     try:
         cursor = cn.cursor()
-        query = """INSERT INTO dbo.PrediccionesTrafico
-        (duracion, paquetes, bytes, puerto, protocolo, intentos_fallidos, probabilidad, clasificacion)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)"""
+        # Insercion via procedimiento almacenado (sql/03_procedimientos.sql)
+        query = """EXEC dbo.sp_InsertarPrediccion
+        @Duracion = ?, @Paquetes = ?, @Bytes = ?, @Puerto = ?, @Protocolo = ?,
+        @IntentosFallidos = ?, @Probabilidad = ?, @Clasificacion = ?"""
         filas = [(
             float(r.duracion), int(r.paquetes), int(r.bytes), int(r.puerto),
             str(r.protocolo), int(r.intentos_fallidos), float(r.probabilidad),

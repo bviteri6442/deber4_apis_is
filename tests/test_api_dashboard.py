@@ -7,7 +7,7 @@ Ejecutar desde la carpeta practica002:
 import sys
 import types
 import unittest
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from unittest import mock
 
@@ -77,43 +77,42 @@ COLUMNAS_REGISTROS = [
 ]
 
 
-class FiltrosTest(unittest.TestCase):
-    def test_sin_filtros_no_agrega_where(self):
-        self.assertEqual(api.construir_filtros({}), ("", ()))
+SIN_FILTROS = {"FechaDesde": None, "FechaHasta": None, "Protocolo": None,
+               "Puerto": None, "Clasificacion": None}
 
-    def test_valores_vacios_no_aplican_condicion(self):
+
+class FiltrosTest(unittest.TestCase):
+    def test_sin_filtros_envia_null(self):
+        self.assertEqual(api.construir_filtros({}), SIN_FILTROS)
+
+    def test_valores_vacios_se_envian_como_null(self):
         args = {"fecha_desde": "", "fecha_hasta": " ", "protocolo": "",
                 "puerto": "", "clasificacion": ""}
-        self.assertEqual(api.construir_filtros(args), ("", ()))
+        self.assertEqual(api.construir_filtros(args), SIN_FILTROS)
 
-    def test_fecha_final_incluye_el_dia_completo(self):
-        where, params = api.construir_filtros(
+    def test_fechas_se_envian_como_date(self):
+        params = api.construir_filtros(
             {"fecha_desde": "2026-10-01", "fecha_hasta": "2026-10-26"})
-        self.assertEqual(
-            where,
-            " WHERE fecha_prediccion >= ? AND fecha_prediccion < ?")
-        self.assertEqual(params, (datetime(2026, 10, 1), datetime(2026, 10, 27)))
+        # El SP suma el dia a FechaHasta (DATEADD) para incluir el dia completo
+        self.assertEqual(params["FechaDesde"], date(2026, 10, 1))
+        self.assertEqual(params["FechaHasta"], date(2026, 10, 26))
 
     def test_combinacion_de_todos_los_filtros(self):
-        where, params = api.construir_filtros({
+        params = api.construir_filtros({
             "fecha_desde": "2026-10-01", "fecha_hasta": "2026-10-26",
             "protocolo": "tcp", "puerto": "443", "clasificacion": "Sospechoso",
         })
+        self.assertEqual(list(params), list(api.PARAMETROS_FILTRO))
         self.assertEqual(
-            where,
-            " WHERE fecha_prediccion >= ? AND fecha_prediccion < ?"
-            " AND protocolo = ? AND puerto = ? AND clasificacion = ?")
-        self.assertEqual(params[2:], ("TCP", 443, "Sospechoso"))
+            (params["Protocolo"], params["Puerto"], params["Clasificacion"]),
+            ("TCP", 443, "Sospechoso"))
+
+    def test_puerto_cero_es_valido(self):
+        self.assertEqual(api.construir_filtros({"puerto": "0"})["Puerto"], 0)
 
     def test_protocolo_inexistente_no_es_error(self):
-        where, params = api.construir_filtros({"protocolo": "XYZ"})
-        self.assertEqual(params, ("XYZ",))
-
-    def test_valor_malicioso_viaja_como_parametro(self):
-        where, params = api.construir_filtros(
-            {"protocolo": "TCP' OR '1'='1"})
-        self.assertNotIn("OR", where)
-        self.assertEqual(params, ("TCP' OR '1'='1",))
+        self.assertEqual(
+            api.construir_filtros({"protocolo": "XYZ"})["Protocolo"], "XYZ")
 
     def test_fecha_con_formato_invalido(self):
         with self.assertRaisesRegex(api.FiltroInvalido, "fecha_desde"):
@@ -127,9 +126,9 @@ class FiltrosTest(unittest.TestCase):
                 {"fecha_desde": "2026-10-26", "fecha_hasta": "2026-10-01"})
 
     def test_mismo_dia_es_valido(self):
-        where, params = api.construir_filtros(
+        params = api.construir_filtros(
             {"fecha_desde": "2026-10-26", "fecha_hasta": "2026-10-26"})
-        self.assertEqual(len(params), 2)
+        self.assertEqual(params["FechaDesde"], params["FechaHasta"])
 
     def test_puerto_fuera_de_rango(self):
         with self.assertRaisesRegex(api.FiltroInvalido, "rango"):
@@ -158,40 +157,57 @@ class EndpointsTest(unittest.TestCase):
         self.addCleanup(patcher.stop)
         return cursor, cn
 
-    def test_resumen_sin_filtros_no_usa_where(self):
+    def test_resumen_llama_al_sp_con_null_sin_filtros(self):
         cursor, cn = self.conectar()
         respuesta = self.cliente.get("/api/dashboard/resumen")
         self.assertEqual(respuesta.status_code, 200)
         sql, params = cursor.ejecutado[0]
-        self.assertNotIn("WHERE", sql)
-        self.assertEqual(params, ())
+        self.assertEqual(
+            sql,
+            "EXEC dbo.sp_Dashboard_Resumen @FechaDesde = ?, @FechaHasta = ?,"
+            " @Protocolo = ?, @Puerto = ?, @Clasificacion = ?")
+        self.assertEqual(params, (None,) * 5)
         self.assertTrue(cn.cerrada)
 
-    def test_resumen_aplica_los_filtros_con_parametros(self):
+    def test_resumen_envia_los_filtros_como_parametros(self):
         cursor, _ = self.conectar()
         self.cliente.get("/api/dashboard/resumen?protocolo=TCP&puerto=443")
-        sql, params = cursor.ejecutado[0]
-        self.assertIn("WHERE protocolo = ? AND puerto = ?", sql)
-        self.assertEqual(params, ("TCP", 443))
+        _, params = cursor.ejecutado[0]
+        self.assertEqual(params, (None, None, "TCP", 443, None))
 
-    def test_todos_los_endpoints_agregados_aplican_el_mismo_filtro(self):
-        rutas = [
-            "/api/dashboard/resumen",
-            "/api/dashboard/por-clasificacion",
-            "/api/dashboard/por-protocolo",
-            "/api/dashboard/por-puerto",
-            "/api/dashboard/distribucion-probabilidad",
-            "/api/dashboard/intentos-fallidos",
-            "/api/dashboard/registros",
-        ]
-        for ruta in rutas:
+    def test_ningun_endpoint_usa_sql_directo(self):
+        rutas = {
+            "/api/dashboard/resumen": "sp_Dashboard_Resumen",
+            "/api/dashboard/por-clasificacion": "sp_Dashboard_PorClasificacion",
+            "/api/dashboard/por-protocolo": "sp_Dashboard_PorProtocolo",
+            "/api/dashboard/por-puerto": "sp_Dashboard_PorPuerto",
+            "/api/dashboard/distribucion-probabilidad": "sp_Dashboard_DistribucionProbabilidad",
+            "/api/dashboard/intentos-fallidos": "sp_Dashboard_IntentosFallidos",
+            "/api/dashboard/registros": "sp_Dashboard_Registros",
+        }
+        for ruta, sp in rutas.items():
             with self.subTest(ruta=ruta):
                 cursor, _ = self.conectar()
                 self.cliente.get(ruta + "?protocolo=UDP&puerto=53")
                 sql, params = cursor.ejecutado[0]
-                self.assertIn("protocolo = ?", sql, ruta)
-                self.assertIn("puerto = ?", sql, ruta)
-                self.assertEqual(params, ("UDP", 53), ruta)
+                self.assertTrue(sql.startswith(f"EXEC dbo.{sp} "), sql)
+                for palabra in ("SELECT", "FROM", "WHERE"):
+                    self.assertNotIn(palabra, sql)
+                self.assertEqual(params[2:4], ("UDP", 53), ruta)
+
+    def test_valor_malicioso_viaja_como_parametro(self):
+        cursor, _ = self.conectar()
+        self.cliente.get("/api/dashboard/resumen?protocolo=TCP' OR '1'='1")
+        sql, params = cursor.ejecutado[0]
+        self.assertNotIn("OR", sql)
+        self.assertEqual(params[2], "TCP' OR '1'='1".upper())
+
+    def test_por_puerto_envia_top_acotado(self):
+        cursor, _ = self.conectar()
+        self.cliente.get("/api/dashboard/por-puerto?top=500")
+        sql, params = cursor.ejecutado[0]
+        self.assertTrue(sql.endswith("@Top = ?"))
+        self.assertEqual(params[-1], 100)
 
     def test_filtro_invalido_responde_400_sin_consultar(self):
         with mock.patch.object(api, "conexion") as conexion:
@@ -200,19 +216,19 @@ class EndpointsTest(unittest.TestCase):
             self.assertEqual(respuesta.status_code, 400)
             conexion.assert_not_called()
 
-    def test_registros_sin_limite_no_usa_top(self):
+    def test_registros_sin_limite_envia_null(self):
         cursor, _ = self.conectar(COLUMNAS_REGISTROS, [])
         respuesta = self.cliente.get("/api/dashboard/registros")
         self.assertEqual(respuesta.status_code, 200)
-        sql, _ = cursor.ejecutado[0]
-        self.assertNotIn("TOP", sql)
-        self.assertIn("ORDER BY fecha_prediccion DESC, id_prediccion DESC", sql)
+        sql, params = cursor.ejecutado[0]
+        self.assertTrue(sql.endswith("@Limite = ?"))
+        self.assertIsNone(params[-1])
 
-    def test_registros_con_limite_usa_top(self):
+    def test_registros_con_limite(self):
         cursor, _ = self.conectar(COLUMNAS_REGISTROS, [])
         self.cliente.get("/api/dashboard/registros?limite=50")
-        sql, _ = cursor.ejecutado[0]
-        self.assertIn("TOP (50)", sql)
+        _, params = cursor.ejecutado[0]
+        self.assertEqual(params[-1], 50)
 
     def test_registros_limite_invalido(self):
         for valor in ("0", "-5", "abc"):
@@ -262,15 +278,14 @@ class EndpointsTest(unittest.TestCase):
         self.assertEqual(datos, [])
 
     def test_totales_coinciden_con_los_registros_filtrados(self):
-        """El resumen y el detalle deben usar la misma clausula WHERE."""
+        """El resumen y el detalle deben recibir los mismos filtros."""
         cursor, _ = self.conectar()
         self.cliente.get("/api/dashboard/resumen?clasificacion=Sospechoso")
         self.cliente.get("/api/dashboard/registros?clasificacion=Sospechoso")
-        sql_resumen, params_resumen = cursor.ejecutado[0]
-        sql_registros, params_registros = cursor.ejecutado[1]
-        self.assertIn("FROM dbo.PrediccionesTrafico WHERE clasificacion = ?", sql_resumen)
-        self.assertIn("FROM dbo.PrediccionesTrafico WHERE clasificacion = ?", sql_registros)
-        self.assertEqual(params_resumen, params_registros)
+        _, params_resumen = cursor.ejecutado[0]
+        _, params_registros = cursor.ejecutado[1]
+        self.assertEqual(params_resumen, (None, None, None, None, "Sospechoso"))
+        self.assertEqual(params_registros[:5], params_resumen)
 
 
 class PrediccionesNoAfectadasTest(unittest.TestCase):
@@ -302,6 +317,29 @@ class PrediccionesNoAfectadasTest(unittest.TestCase):
         with mock.patch.object(api, "habilitada", return_value=False):
             respuesta = self.cliente.get("/api/health")
         self.assertEqual(respuesta.get_json()["sql_server"], False)
+
+
+class InsercionTest(unittest.TestCase):
+    def test_guardar_usa_sp_insertar(self):
+        from collections import namedtuple
+        from app import database
+        Fila = namedtuple("Fila", "duracion paquetes bytes puerto protocolo "
+                                  "intentos_fallidos probabilidad clasificacion")
+
+        class Resultados:
+            def itertuples(self, index=False):
+                return iter([Fila(1.5, 10, 500, 443, "TCP", 0, 0.2, "Normal")])
+
+        cursor = mock.Mock()
+        cn = mock.Mock(cursor=mock.Mock(return_value=cursor))
+        with mock.patch.object(database, "habilitada", return_value=True), \
+                mock.patch.object(database, "conexion", return_value=cn):
+            self.assertEqual(database.guardar(Resultados()), 1)
+        sql, filas = cursor.executemany.call_args.args
+        self.assertTrue(sql.startswith("EXEC dbo.sp_InsertarPrediccion"))
+        self.assertNotIn("INSERT", sql)
+        self.assertEqual(filas, [(1.5, 10, 500, 443, "TCP", 0, 0.2, "Normal")])
+        cn.commit.assert_called_once()
 
 
 if __name__ == "__main__":

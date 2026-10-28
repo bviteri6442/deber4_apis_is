@@ -2,6 +2,50 @@
 
 > Written for: el equipo del taller que conecta la API con Power BI.
 
+## 0. Procedimientos almacenados (requisito del taller)
+
+La API **no ejecuta SQL directo** sobre `dbo.PrediccionesTrafico`. Cada endpoint
+llama a un procedimiento almacenado de `sql/03_procedimientos.sql` y le pasa los
+filtros como parámetros. Flujo:
+
+```
+Power BI  --HTTP-->  API Flask  --EXEC dbo.sp_...-->  SQL Server  -->  dbo.PrediccionesTrafico
+```
+
+| Endpoint / uso | Procedimiento almacenado |
+|---|---|
+| `POST /api/trafico/predecir`, `POST /api/trafico/lote` (guardar) | `dbo.sp_InsertarPrediccion` |
+| `GET /api/dashboard/registros` | `dbo.sp_Dashboard_Registros` |
+| `GET /api/dashboard/resumen` | `dbo.sp_Dashboard_Resumen` |
+| `GET /api/dashboard/por-clasificacion` | `dbo.sp_Dashboard_PorClasificacion` |
+| `GET /api/dashboard/por-protocolo` | `dbo.sp_Dashboard_PorProtocolo` |
+| `GET /api/dashboard/por-puerto` | `dbo.sp_Dashboard_PorPuerto` |
+| `GET /api/dashboard/distribucion-probabilidad` | `dbo.sp_Dashboard_DistribucionProbabilidad` |
+| `GET /api/dashboard/intentos-fallidos` | `dbo.sp_Dashboard_IntentosFallidos` |
+| (validación interna) | `dbo.sp_ValidarFiltros` |
+
+Parámetros comunes de los SP del dashboard (todos opcionales, `NULL` = sin filtro):
+
+| Parámetro SP | Tipo | Parámetro URL |
+|---|---|---|
+| `@FechaDesde` | `DATE` | `fecha_desde` |
+| `@FechaHasta` | `DATE` (incluye el día completo) | `fecha_hasta` |
+| `@Protocolo` | `VARCHAR(10)` | `protocolo` |
+| `@Puerto` | `INT` | `puerto` |
+| `@Clasificacion` | `VARCHAR(15)` | `clasificacion` |
+
+Extras: `@Limite` en `sp_Dashboard_Registros` y `@Top` en `sp_Dashboard_PorPuerto`.
+
+La sentencia que envía la API tiene siempre esta forma (los valores van en `?`):
+
+```sql
+EXEC dbo.sp_Dashboard_Resumen @FechaDesde = ?, @FechaHasta = ?, @Protocolo = ?, @Puerto = ?, @Clasificacion = ?
+```
+
+Instalación: en SSMS ejecutar `sql/01_crear_bd.sql` y luego
+`sql/03_procedimientos.sql`. Los SP aparecen en
+**TraficoIA > Programación > Procedimientos almacenados**.
+
 ## 1. Resumen de la decisión
 
 **Arquitectura elegida: Alternativa A (tabla de registros común).**
@@ -31,12 +75,15 @@ Archivos modificados:
 
 | Archivo | Cambio |
 |---|---|
-| `api.py` | Bloque del dashboard reescrito: función común `construir_filtros`, todos los endpoints `/api/dashboard/*` aplican los mismos filtros, `limite` opcional sin tope por defecto, orden estable en `registros`, fechas en ISO 8601. |
-| `tests/test_api_dashboard.py` | Nuevo: 28 pruebas unitarias con mocks. |
+| `api.py` | Bloque del dashboard: sin SQL directo. `ejecutar_sp` llama a `EXEC dbo.sp_...` con parámetros nombrados; `construir_filtros` valida y devuelve los parámetros (vacío → `NULL`). |
+| `app/database.py` | `guardar` inserta con `EXEC dbo.sp_InsertarPrediccion` en lugar de `INSERT`. |
+| `sql/03_procedimientos.sql` | Nuevo: los procedimientos almacenados. |
+| `sql/02_consultas_powerbi.sql` | Ejemplos con `EXEC` de los SP. |
+| `tests/test_api_dashboard.py` | 31 pruebas unitarias con mocks (comprueban que no hay `SELECT` en la API). |
 | `docs/auditoria/integracion_powerbi.md` | Nuevo: este documento. |
 
-Sin cambios: endpoints de predicción (`/api/trafico/predecir`, `/lote`,
-`/probar`), `/api/health`, `app/`, esquema SQL y datos.
+Sin cambios: contrato de los endpoints (mismas URL, filtros y respuestas),
+`/api/trafico/probar`, `/api/health`, esquema de la tabla y datos.
 
 ## 3. Verificación de la base de datos
 
@@ -60,8 +107,8 @@ Valores válidos según `app/comun.py`: protocolos `TCP`, `UDP`, `ICMP`; puertos
 la respuesta es una lista vacía.
 
 Existe el índice `IX_Predicciones_Fecha`. Los filtros de fecha usan
-comparaciones por rango sobre la columna sin funciones, para que el índice
-pueda usarse.
+comparaciones por rango sobre la columna sin funciones y los SP llevan
+`OPTION (RECOMPILE)`, para que el índice pueda usarse cuando llega una fecha.
 
 ## 4. Filtros comunes
 
@@ -78,7 +125,9 @@ Todos son opcionales. Un valor vacío no aplica condición.
 Reglas:
 
 - `fecha_desde` posterior a `fecha_hasta` → 400.
-- Los valores se envían como parámetros `?` de pyodbc. Nunca se concatenan al SQL.
+- Los valores se envían como parámetros `?` de pyodbc al `EXEC` del SP. Nunca se concatenan al SQL.
+- La API valida antes de llamar al SP (responde 400 sin tocar la base); el SP
+  vuelve a validar con `dbo.sp_ValidarFiltros` por si se ejecuta desde SSMS.
 - Fecha final inclusiva: la condición es `fecha_prediccion < (fecha_hasta + 1 día)`.
 
 ## 5. Endpoints
@@ -174,6 +223,44 @@ in
    revisar los tipos igual que arriba.
 5. Cerrar y aplicar.
 
+### Opcional: parámetros de Power Query en la URL
+
+Si el docente pide que el dashboard **reciba parámetros** (y no solo filtrar con
+segmentaciones), crear en **Transformar datos > Administrar parámetros > Nuevo
+parámetro** estos parámetros de tipo Texto (valor vacío = sin filtro):
+`pFechaDesde`, `pFechaHasta`, `pProtocolo`, `pPuerto`.
+
+Consulta `Registros` usando los parámetros (Power BI los envía a la API y la API
+al SP):
+
+```
+let
+    Filtros = [
+        fecha_desde = pFechaDesde,
+        fecha_hasta = pFechaHasta,
+        protocolo   = pProtocolo,
+        puerto      = pPuerto
+    ],
+    Origen = Json.Document(Web.Contents(
+        "http://127.0.0.1:5000",
+        [RelativePath = "api/dashboard/registros", Query = Filtros])),
+    ComoTabla = Table.FromRecords(Origen),
+    Tipos = Table.TransformColumnTypes(ComoTabla, {
+        {"id_prediccion", Int64.Type}, {"fecha_prediccion", type datetime},
+        {"duracion", type number}, {"paquetes", Int64.Type}, {"bytes", Int64.Type},
+        {"puerto", Int64.Type}, {"protocolo", type text},
+        {"intentos_fallidos", Int64.Type}, {"probabilidad", type number},
+        {"clasificacion", type text}}),
+    ConFecha = Table.AddColumn(Tipos, "fecha", each DateTime.Date([fecha_prediccion]), type date)
+in
+    ConFecha
+```
+
+Para cambiar los filtros: **Inicio > Transformar datos > Editar parámetros** y
+**Actualizar**. El mismo patrón sirve para `resumen`, `por-protocolo`, etc.
+(cambiando `RelativePath`). Si una consulta devuelve `[]`, `Table.FromRecords`
+produce una tabla sin columnas: es normal cuando el filtro no tiene datos.
+
 ### Segmentaciones (en la tabla `Registros`)
 
 | Segmentación | Campo | Tipo de segmentación |
@@ -245,10 +332,9 @@ Por eso no se recomienda para este dashboard.
   refresca solo.
 - **Volumen.** `registros` sin `limite` devuelve **todos** los registros. Para
   volúmenes pequeños y medianos esto funciona bien. Si la tabla crece hasta cifras
-  de cientos de miles o más, conviene conectar Power BI directamente a SQL Server
-  con el conector nativo sobre `dbo.PrediccionesTrafico` (así los filtros se
-  traducen a SQL) y usar la API solo para predicciones. Esto es una recomendación:
-  no se ha medido un umbral.
+  de cientos de miles o más, se puede usar el conector nativo de SQL Server con
+  una instrucción `EXEC dbo.sp_Dashboard_Registros ...` (opciones avanzadas), sin
+  leer la tabla directamente. Esto es una recomendación: no se ha medido un umbral.
 - **`limite`.** Si se usa, la tabla importada queda truncada y las medidas DAX
   serán incorrectas. Por eso no se usa en el dashboard.
 - **Zona horaria.** `fecha_prediccion` se guarda en UTC. Los filtros de fecha y la
@@ -275,30 +361,33 @@ Por eso no se recomienda para este dashboard.
 python -m unittest discover -s tests -v
 ```
 
-Resultado: **28 pruebas, 28 correctas, 0 fallos.** Las pruebas usan un cursor y
+Resultado: **31 pruebas, 31 correctas, 0 fallos.** Las pruebas usan un cursor y
 una conexión simulados, y sustituyen el `Predictor` para no cargar TensorFlow.
 
 Cubren:
 
-- Consulta sin filtros (sin `WHERE`).
-- Filtro por fecha inicial, por fecha final (día completo incluido) y por rango.
-- Filtro por protocolo, puerto, clasificación y combinación de todos.
-- Mismo conjunto de filtros en los siete endpoints de dashboard.
+- Cada endpoint ejecuta `EXEC dbo.sp_...` correcto y la sentencia no contiene
+  `SELECT`, `FROM` ni `WHERE` (sin SQL directo).
+- La inserción usa `EXEC dbo.sp_InsertarPrediccion` (sin `INSERT`).
+- Sin filtros se envían `NULL`; filtros vacíos también.
+- Fechas como `date`, protocolo en mayúsculas, puerto entero, combinación de todos.
+- Mismo conjunto de filtros en los siete endpoints de dashboard; `top` acotado a 100.
 - Protocolo inexistente → no es error; valor malicioso → viaja como parámetro.
 - Fechas con formato inválido, fecha inicial posterior a la final, mismo día válido.
 - Puerto fuera de rango y no numérico.
-- `limite` sin valor (sin `TOP`), con valor (con `TOP`) e inválido (400).
+- `limite` sin valor (`@Limite = NULL`), con valor e inválido (400).
 - Fechas en ISO 8601 y exportación CSV.
 - Base de datos deshabilitada (503), error de SQL y de conexión (500 sin detalles).
 - Resultados vacíos (`[]`).
-- `resumen` y `registros` con el mismo `WHERE` y los mismos parámetros.
+- `resumen` y `registros` con los mismos parámetros de filtro.
 - `/api/trafico/predecir` sigue guardando, `/api/trafico/probar` no guarda,
   `/api/health` sin cambios.
 
 ### Pendientes (no ejecutadas)
 
-- **Integración con SQL Server real.** No se ha podido conectar en este entorno.
-  Hay que comprobar: que `fecha_prediccion` se rellena al insertar, que los
+- **Integración con SQL Server real.** No se ha podido conectar en este entorno,
+  así que los SP no se han ejecutado aquí. Hay que ejecutar
+  `sql/03_procedimientos.sql` en SSMS y comprobar: que `fecha_prediccion` se rellena al insertar, que los
   filtros devuelven los mismos totales que una consulta manual en SSMS, y que
   `probabilidad` y las sumas de `resumen` coinciden.
 - **Power BI real.** No se ha probado la importación ni las medidas DAX en

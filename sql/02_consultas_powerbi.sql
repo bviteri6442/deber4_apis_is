@@ -1,21 +1,19 @@
 USE TraficoIA;
 GO
--- 1. Histórico de todas las clasificaciones (Power BI puede conectarse a tabla directamente).
-SELECT id_prediccion, fecha_prediccion, puerto, protocolo,
-       intentos_fallidos, probabilidad, clasificacion
-FROM dbo.PrediccionesTrafico;
+-- La API y Power BI ya NO consultan la tabla directamente.
+-- Todo pasa por los procedimientos almacenados de 03_procedimientos.sql.
+-- Ejemplos para probar en SSMS (los mismos que ejecuta la API):
+
+-- 1. Historico de todas las clasificaciones (tabla fuente del dashboard)
+EXEC dbo.sp_Dashboard_Registros;
 GO
--- 2. Resumen por fecha y resultado
-SELECT CAST(fecha_prediccion AS date) AS fecha,
-       clasificacion, COUNT(*) AS total
-FROM dbo.PrediccionesTrafico
-GROUP BY CAST(fecha_prediccion AS date), clasificacion
-ORDER BY fecha;
+-- 2. Con filtros (NULL o parametro omitido = sin filtro)
+EXEC dbo.sp_Dashboard_Registros @FechaDesde = '2026-10-01', @FechaHasta = '2026-10-28',
+     @Protocolo = 'TCP', @Puerto = 443;
 GO
--- 3. Puertos con más alertas
-SELECT TOP (10) puerto, COUNT(*) AS total_sospechosas
-FROM dbo.PrediccionesTrafico
-WHERE clasificacion = 'Sospechoso'
-GROUP BY puerto
-ORDER BY total_sospechosas DESC;
+-- 3. KPIs
+EXEC dbo.sp_Dashboard_Resumen @Clasificacion = 'Sospechoso';
+GO
+-- 4. Puertos con mas alertas
+EXEC dbo.sp_Dashboard_PorPuerto @Clasificacion = 'Sospechoso', @Top = 10;
 GO

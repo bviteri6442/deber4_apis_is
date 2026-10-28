@@ -5,7 +5,7 @@
 import csv
 import io
 import os
-from datetime import datetime, timedelta
+from datetime import date, datetime
 from flask import Flask, request, jsonify, Response
 from dotenv import load_dotenv
 from app.predictor import Predictor
@@ -146,32 +146,44 @@ def probar():
 
 # =========================================
 # APIs PARA DASHBOARD DE POWER BI
-# Leen dbo.PrediccionesTrafico (SQL Server).
+# Cada endpoint llama a un PROCEDIMIENTO ALMACENADO (sql/03_procedimientos.sql).
+# La API no contiene SELECT sobre la tabla: solo EXEC dbo.sp_... con parametros.
 # Power BI: Obtener datos > Web > URL del endpoint.
 # Todas devuelven una lista JSON de registros (tabla plana).
 #
-# Filtros comunes, todos opcionales (un valor vacio no aplica condicion):
+# Filtros comunes, todos opcionales (un valor vacio se envia como NULL):
 #   fecha_desde, fecha_hasta (YYYY-MM-DD, fecha UTC), protocolo, puerto,
-#   clasificacion. Se aplican con AND dentro de la misma consulta.
+#   clasificacion. El SP los aplica con AND.
 # =========================================
 class FiltroInvalido(ValueError):
     """Parametro de filtro no valido: se responde con HTTP 400."""
 
 
-def consultar(sql, params=()):
-    """Ejecuta un SELECT parametrizado y devuelve lista de dicts."""
+# Parametros de filtro que reciben todos los SP del dashboard (en este orden)
+PARAMETROS_FILTRO = ("FechaDesde", "FechaHasta", "Protocolo", "Puerto", "Clasificacion")
+
+
+def ejecutar_sp(nombre, params=None):
+    """Ejecuta EXEC dbo.<nombre> con parametros nombrados y devuelve lista de dicts.
+
+    params: dict {NombreParametro: valor}. Los valores viajan como ?, nunca
+    dentro del texto SQL. El nombre del SP es fijo en el codigo, no viene del usuario.
+    """
     if not habilitada():
         raise RuntimeError("SQL Server deshabilitado (DB_ENABLED=false)")
+    params = params or {}
+    asignaciones = ", ".join(f"@{p} = ?" for p in params)
+    sql = f"EXEC dbo.{nombre} {asignaciones}".strip()
     cn = conexion()
     try:
         cursor = cn.cursor()
-        cursor.execute(sql, params)
+        cursor.execute(sql, tuple(params.values()))
         columnas = [c[0] for c in cursor.description]
         filas = [dict(zip(columnas, fila)) for fila in cursor.fetchall()]
         cursor.close()
         # Fechas en ISO 8601 (jsonify las enviaria en formato HTTP-date)
         return [
-            {c: v.isoformat() if isinstance(v, datetime) else v
+            {c: v.isoformat() if isinstance(v, (datetime, date)) else v
              for c, v in fila.items()}
             for fila in filas
         ]
@@ -179,10 +191,10 @@ def consultar(sql, params=()):
         cn.close()
 
 
-def dashboard(sql, params=()):
-    """Envuelve una consulta del dashboard con manejo de errores comun."""
+def dashboard(nombre, params=None):
+    """Ejecuta un SP del dashboard con manejo de errores comun."""
     try:
-        return jsonify(consultar(sql, params))
+        return jsonify(ejecutar_sp(nombre, params))
     except RuntimeError as exc:
         return jsonify(error=str(exc)), 503
     except Exception:
@@ -191,103 +203,68 @@ def dashboard(sql, params=()):
 
 
 def leer_fecha(texto, nombre):
-    """Convierte YYYY-MM-DD a datetime a medianoche; None si viene vacia."""
+    """Convierte YYYY-MM-DD a date; None si viene vacia."""
     if not texto:
         return None
     try:
-        return datetime.strptime(texto, "%Y-%m-%d")
+        return datetime.strptime(texto, "%Y-%m-%d").date()
     except ValueError:
         raise FiltroInvalido(f"{nombre} debe tener formato YYYY-MM-DD")
 
 
 def construir_filtros(args):
-    """Devuelve (clausula WHERE, parametros) a partir de los filtros de la URL.
+    """Devuelve el dict de parametros de filtro para los SP.
 
-    Los valores siempre viajan como parametros ?, nunca dentro del SQL.
+    Un filtro vacio se envia como None (NULL en SQL Server = sin filtro).
+    Se valida aqui para responder 400 sin llegar a la base de datos; el SP
+    vuelve a validar (dbo.sp_ValidarFiltros).
     """
     desde = leer_fecha(args.get("fecha_desde", "").strip(), "fecha_desde")
     hasta = leer_fecha(args.get("fecha_hasta", "").strip(), "fecha_hasta")
     if desde and hasta and desde > hasta:
         raise FiltroInvalido("fecha_desde no puede ser posterior a fecha_hasta")
 
-    condiciones = []
-    params = []
-
-    if desde:
-        condiciones.append("fecha_prediccion >= ?")
-        params.append(desde)
-
-    # Rango abierto al final: incluye todo el dia de fecha_hasta
-    if hasta:
-        condiciones.append("fecha_prediccion < ?")
-        params.append(hasta + timedelta(days=1))
-
-    protocolo = args.get("protocolo", "").strip().upper()
-    if protocolo:
-        condiciones.append("protocolo = ?")
-        params.append(protocolo)
-
     puerto = args.get("puerto", "").strip()
     if puerto:
         if not puerto.isdigit() or int(puerto) > 65535:
             raise FiltroInvalido("Puerto fuera de rango (0-65535)")
-        condiciones.append("puerto = ?")
-        params.append(int(puerto))
+        puerto = int(puerto)
 
-    clasificacion = args.get("clasificacion", "").strip()
-    if clasificacion:
-        condiciones.append("clasificacion = ?")
-        params.append(clasificacion)
-
-    if not condiciones:
-        return "", ()
-    return " WHERE " + " AND ".join(condiciones), tuple(params)
+    return {
+        "FechaDesde": desde,
+        "FechaHasta": hasta,
+        "Protocolo": args.get("protocolo", "").strip().upper() or None,
+        "Puerto": puerto if puerto != "" else None,
+        "Clasificacion": args.get("clasificacion", "").strip() or None,
+    }
 
 
-def dashboard_filtrado(plantilla):
-    """Ejecuta una consulta del dashboard con los filtros de la URL.
-
-    La plantilla debe contener {where} donde va la clausula de filtros.
-    """
+def dashboard_filtrado(nombre, extra=None):
+    """Ejecuta un SP del dashboard con los filtros de la URL (+ parametros extra)."""
     try:
-        where, params = construir_filtros(request.args)
+        params = construir_filtros(request.args)
     except FiltroInvalido as exc:
         return jsonify(error=str(exc)), 400
-    return dashboard(plantilla.replace("{where}", where), params)
+    params.update(extra or {})
+    return dashboard(nombre, params)
 
 
 # 5. KPIs generales (una sola fila: tarjetas del dashboard)
 @app.get("/api/dashboard/resumen")
 def dash_resumen():
-    return dashboard_filtrado("""
-        SELECT COUNT(*) AS total_conexiones,
-               SUM(CASE WHEN clasificacion <> 'Normal' THEN 1 ELSE 0 END) AS total_sospechosas,
-               AVG(CAST(probabilidad AS FLOAT)) AS probabilidad_promedio,
-               AVG(CAST(duracion AS FLOAT)) AS duracion_promedio,
-               AVG(CAST(paquetes AS FLOAT)) AS paquetes_promedio,
-               SUM(CAST(bytes AS BIGINT)) AS bytes_totales,
-               SUM(intentos_fallidos) AS intentos_fallidos_totales
-        FROM dbo.PrediccionesTrafico{where}""")
+    return dashboard_filtrado("sp_Dashboard_Resumen")
 
 
 # 6. Conteo por clasificacion (grafico circular / barras)
 @app.get("/api/dashboard/por-clasificacion")
 def dash_clasificacion():
-    return dashboard_filtrado("""
-        SELECT clasificacion, COUNT(*) AS total,
-               AVG(CAST(probabilidad AS FLOAT)) AS probabilidad_promedio
-        FROM dbo.PrediccionesTrafico{where}
-        GROUP BY clasificacion ORDER BY total DESC""")
+    return dashboard_filtrado("sp_Dashboard_PorClasificacion")
 
 
 # 7. Conteo por protocolo y clasificacion (barras apiladas)
 @app.get("/api/dashboard/por-protocolo")
 def dash_protocolo():
-    return dashboard_filtrado("""
-        SELECT protocolo, clasificacion, COUNT(*) AS total,
-               AVG(CAST(bytes AS FLOAT)) AS bytes_promedio
-        FROM dbo.PrediccionesTrafico{where}
-        GROUP BY protocolo, clasificacion ORDER BY protocolo, total DESC""")
+    return dashboard_filtrado("sp_Dashboard_PorProtocolo")
 
 
 # 8. Puertos mas usados (?top=10)
@@ -295,37 +272,19 @@ def dash_protocolo():
 def dash_puerto():
     top = request.args.get("top", default=10, type=int)
     top = max(1, min(top, 100))
-    return dashboard_filtrado(f"""
-        SELECT TOP ({top}) puerto, clasificacion, COUNT(*) AS total
-        FROM dbo.PrediccionesTrafico{{where}}
-        GROUP BY puerto, clasificacion ORDER BY total DESC""")
+    return dashboard_filtrado("sp_Dashboard_PorPuerto", {"Top": top})
 
 
 # 9. Distribucion de probabilidad en rangos de 10% (histograma)
 @app.get("/api/dashboard/distribucion-probabilidad")
 def dash_probabilidad():
-    return dashboard_filtrado("""
-        SELECT rango, clasificacion, COUNT(*) AS total
-        FROM (SELECT clasificacion,
-                     CASE WHEN probabilidad >= 1 THEN 9
-                          ELSE FLOOR(probabilidad * 10) END AS bucket,
-                     CONCAT(CASE WHEN probabilidad >= 1 THEN 90
-                                 ELSE FLOOR(probabilidad * 10) * 10 END,
-                            '-',
-                            CASE WHEN probabilidad >= 1 THEN 100
-                                 ELSE FLOOR(probabilidad * 10) * 10 + 10 END, '%') AS rango
-              FROM dbo.PrediccionesTrafico{where}) t
-        GROUP BY bucket, rango, clasificacion ORDER BY bucket""")
+    return dashboard_filtrado("sp_Dashboard_DistribucionProbabilidad")
 
 
 # 10. Intentos fallidos agrupados (dispersion / barras)
 @app.get("/api/dashboard/intentos-fallidos")
 def dash_intentos():
-    return dashboard_filtrado("""
-        SELECT intentos_fallidos, clasificacion, COUNT(*) AS total,
-               AVG(CAST(probabilidad AS FLOAT)) AS probabilidad_promedio
-        FROM dbo.PrediccionesTrafico{where}
-        GROUP BY intentos_fallidos, clasificacion ORDER BY intentos_fallidos""")
+    return dashboard_filtrado("sp_Dashboard_IntentosFallidos")
 
 
 # 11. Tabla detalle: fuente recomendada para Power BI (ver docs/auditoria)
@@ -335,28 +294,20 @@ def dash_intentos():
 @app.get("/api/dashboard/registros")
 def dash_registros():
     limite = request.args.get("limite", "").strip()
-    top = ""
-    if limite:
-        if not limite.isdigit() or int(limite) < 1:
-            return jsonify(error="limite debe ser un entero positivo"), 400
-        top = f"TOP ({int(limite)}) "
+    if limite and (not limite.isdigit() or int(limite) < 1):
+        return jsonify(error="limite debe ser un entero positivo"), 400
 
     try:
-        where, params = construir_filtros(request.args)
+        params = construir_filtros(request.args)
     except FiltroInvalido as exc:
         return jsonify(error=str(exc)), 400
-
-    sql = f"""SELECT {top}id_prediccion, fecha_prediccion, duracion, paquetes,
-                     bytes, puerto, protocolo, intentos_fallidos,
-                     probabilidad, clasificacion
-              FROM dbo.PrediccionesTrafico{where}
-              ORDER BY fecha_prediccion DESC, id_prediccion DESC"""
+    params["Limite"] = int(limite) if limite else None
 
     if request.args.get("formato", "").lower() != "csv":
-        return dashboard(sql, params)
+        return dashboard("sp_Dashboard_Registros", params)
 
     try:
-        filas = consultar(sql, params)
+        filas = ejecutar_sp("sp_Dashboard_Registros", params)
     except RuntimeError as exc:
         return jsonify(error=str(exc)), 503
     except Exception:
