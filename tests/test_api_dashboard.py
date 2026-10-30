@@ -265,6 +265,14 @@ class EndpointsTest(unittest.TestCase):
         self.assertEqual(respuesta.status_code, 500)
         self.assertNotIn("secreto", respuesta.get_data(as_text=True))
 
+    def test_sp_inexistente_indica_ejecutar_script(self):
+        self.conectar(error=Exception(
+            "[42000] Could not find stored procedure "
+            "'dbo.sp_Dashboard_Registros'. (2812) (SQLExecDirectW)"))
+        respuesta = self.cliente.get("/api/dashboard/registros")
+        self.assertEqual(respuesta.status_code, 500)
+        self.assertIn("03_procedimientos.sql", respuesta.get_json()["error"])
+
     def test_error_de_conexion_en_csv_responde_500(self):
         with mock.patch.object(api, "conexion", side_effect=OSError("sin red")):
             respuesta = self.cliente.get("/api/dashboard/registros?formato=csv")
