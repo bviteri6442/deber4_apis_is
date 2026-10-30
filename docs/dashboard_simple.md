@@ -70,18 +70,25 @@ Para que el filtro llegue al procedimiento almacenado:
    |---|---|---|
    | `pProtocolo` | Lista: `TCP`, `UDP`, `ICMP` | `TCP` |
    | `pClasificacion` | Lista: `Normal`, `Sospechoso` | (vacío) |
-   | `pFechaDesde` | Cualquier valor (`YYYY-MM-DD`) | (vacío) |
-   | `pFechaHasta` | Cualquier valor (`YYYY-MM-DD`) | (vacío) |
+   | `pFechaDesde` | Cualquier valor (tipo Texto o Fecha) | (vacío) |
+   | `pFechaHasta` | Cualquier valor (tipo Texto o Fecha) | (vacío) |
 
 2. Seleccionar la consulta `Registros` > **Editor avanzado** y cambiar **solo**
    la línea `Origen` por:
 
    ```
+   Texto = (v) => if v = null then ""
+                  else if v is date then Date.ToText(v, "yyyy-MM-dd")
+                  else Text.From(v),
    Origen = Json.Document(Web.Contents("http://127.0.0.1:5000",
        [RelativePath = "api/dashboard/registros",
-        Query = [protocolo = pProtocolo, clasificacion = pClasificacion,
-                 fecha_desde = pFechaDesde, fecha_hasta = pFechaHasta]])),
+        Query = [protocolo = Texto(pProtocolo), clasificacion = Texto(pClasificacion),
+                 fecha_desde = Texto(pFechaDesde), fecha_hasta = Texto(pFechaHasta)]])),
    ```
+
+   `Query` de `Web.Contents` solo acepta texto: un parámetro vacío (`null`) o de
+   tipo Fecha da el error "No se puede convertir el valor null al tipo Text".
+   La función `Texto` convierte `null` en `""` y la fecha en `YYYY-MM-DD`.
 
 3. **Cerrar y aplicar**. Para cambiar el filtro: **Inicio > Transformar datos >
    Editar parámetros** > Aceptar > **Aplicar cambios**.
@@ -89,8 +96,9 @@ Para que el filtro llegue al procedimiento almacenado:
 Recorrido del valor: parámetro `pProtocolo = TCP` → URL `?protocolo=TCP` →
 API → `EXEC dbo.sp_Dashboard_Registros @Protocolo = 'TCP'`.
 
-Si un filtro no tiene datos, la API devuelve `[]` y el paso de expandir
-columnas da error: dejar el parámetro vacío o elegir otro valor.
+Si un filtro no tiene datos, la API devuelve `[]`. Con
+`Table.FromRecords(Origen, {lista de columnas}, MissingField.UseNull)` la tabla
+queda vacía pero con sus columnas, sin error.
 
 ## 6. Comprobar que se usan los SP
 
